@@ -1,0 +1,12 @@
+# Données sources : contiennent des données personnelles, jamais versionnées
+data/
+
+# Secrets (token de l'API)
+.env
+
+# Environnement Python
+.venv/
+__pycache__/
+
+# Fichiers temporaires Jupyter
+.ipynb_checkpoints/
