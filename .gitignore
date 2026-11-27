@@ -10,3 +10,6 @@ __pycache__/
 
 # Fichiers temporaires Jupyter
 .ipynb_checkpoints/
+
+# Base finale : générée par pipeline.py
+bookworld_final.db
