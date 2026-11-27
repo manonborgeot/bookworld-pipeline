@@ -5,6 +5,7 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 import os
+import sys
 
 # --- Paramètres ---
 SALES_CSV = "data/sales_raw.csv"
@@ -68,7 +69,7 @@ def extract_catalogue(url):
     return catalogue
 
 
-def extract_exchange_rate(url):
+def extract_exchange_rates(url):
     """Récupère le taux GBP → EUR du jour."""
     response = requests.get(url, timeout=10)
     response.raise_for_status()
@@ -88,12 +89,12 @@ def extract_exchange_rate(url):
 
 
 # --- 2. Transformation ---
-def transform(sales, countries, channels, catalogue, exchange_rate):
+def transform(sales, countries, channels, catalogue, exchange_rates):
     """Nettoie, joint, calcule le CA et prépare les 6 tables finales."""
 
     # 1. Taux et date (depuis le DataFrame exchange_rate)
-    taux = exchange_rate["rate"][0]
-    rate_date = exchange_rate["rate_date"][0]
+    taux = exchange_rates["rate"][0]
+    rate_date = exchange_rates["rate_date"][0]
 
     # 2. Catalogue : price_eur
     catalogue = catalogue.copy()
@@ -165,7 +166,7 @@ def transform(sales, countries, channels, catalogue, exchange_rate):
     return {
         "countries": countries_final,
         "channels": channels_final,
-        "exchange_rates": exchange_rate,
+        "exchange_rates": exchange_rates,
         "catalogue": catalogue_final,
         "sales": sales_final,
         "sales_by_country": sales_by_country_final,
@@ -196,14 +197,38 @@ def load(tables, db_path, schema_path):
 
 # --- Point d'entrée ---
 def main():
-    sales = extract_sales(SALES_CSV)
-    countries, channels = extract_reference(REFERENCE_DB)
-    catalogue = extract_catalogue(CATALOGUE_URL)
-    exchange_rate = extract_exchange_rate(EXCHANGE_URL)
+    etape = "démarrage"
+    print("Démarrage du pipeline BookWorld")
+    try:
+        etape = "extraction des ventes"
+        sales = extract_sales(SALES_CSV)
+        print(f"  Ventes extraites : {len(sales)} lignes")
 
-    tables = transform(sales, countries, channels, catalogue, exchange_rate)
+        etape = "extraction des référentiels"
+        countries, channels = extract_reference(REFERENCE_DB)
+        print(f"  Référentiels extraits : {len(countries)} pays, {len(channels)} canaux actifs")
 
-    load(tables, FINAL_DB, SCHEMA_SQL)
+        etape = "extraction du catalogue"
+        catalogue = extract_catalogue(CATALOGUE_URL)
+        print(f"  {len(catalogue)} livres récupérés en ligne")
+
+        etape = "récupération du taux de change à date"
+        exchange_rates = extract_exchange_rates(EXCHANGE_URL)
+        print(f"  Le taux de change de GBP vers EUR était de {exchange_rates['rate'][0]} le {exchange_rates['rate_date'][0]}")
+
+        etape = "transformation de l'ensemble des tables"
+        tables = transform(sales, countries, channels, catalogue, exchange_rates)
+        print("  Transformation terminée")
+
+        etape = "chargement des tables"
+        load(tables, FINAL_DB, SCHEMA_SQL)
+        for nom, df in tables.items():
+            print(f"  Table {nom} : {len(df)} lignes chargées")
+
+    except Exception as erreur:
+        print(f"ÉCHEC du pipeline pendant l'étape « {etape} » : {erreur}")
+        sys.exit(1)
+
     print("Pipeline terminé : base finale créée.")
     
 if __name__ == "__main__":
