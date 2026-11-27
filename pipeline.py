@@ -24,10 +24,10 @@ def extract_sales(path):
     return sales
     
 def extract_reference(path):
+    """Lit les tables de référence utiles (pays et canaux) depuis la base SQLite."""
     if not os.path.exists(path):
         raise FileNotFoundError(f"Base de référence introuvable : {path}")
-
-    """Lit les tables de référence utiles (pays et canaux) depuis la base SQLite."""
+    
     conn = sqlite3.connect(path)
 
     query_countries = """
@@ -88,14 +88,111 @@ def extract_exchange_rate(url):
 
 
 # --- 2. Transformation ---
-def transform(sales, countries, channels, catalogue, rate):
+def transform(sales, countries, channels, catalogue, exchange_rate):
     """Nettoie, joint, calcule le CA et prépare les 6 tables finales."""
+
+    # 1. Taux et date (depuis le DataFrame exchange_rate)
+    taux = exchange_rate["rate"][0]
+    rate_date = exchange_rate["rate_date"][0]
+
+    # 2. Catalogue : price_eur
+    catalogue = catalogue.copy()
+    catalogue["price_eur"] = catalogue["price_gbp"] * taux
+
+    # 3. Ventes : conversion de la date, contrôle d'unicité des order_id
+    sales = sales.copy()
+    sales["order_date"] = pd.to_datetime(sales["order_date"])
+    doublons = sales.duplicated(subset=["order_id"]).sum()
+    if doublons > 0:
+        raise ValueError(f"{doublons} order_id en double : vérifier le fichier source")
+    
+    # 4. Jointure ventes ↔ catalogue (book_name) + contrôle : aucun prix manquant
+    sales = sales.merge(catalogue, on="book_name", how="left")
+    titres_sans_prix = sales.loc[sales["price_gbp"].isna(), "book_name"].unique()
+    if len(titres_sans_prix) > 0:
+        raise ValueError(f"Titres sans prix dans le catalogue : {list(titres_sans_prix)}")
+    
+    # 5. Jointure ventes ↔ pays + correction NL + contrôle : aucun pays sans nom
+    countries = countries.copy()
+    sales = sales.merge(countries[["country_code", "country_name"]], on="country_code", how="left")
+    sales["country_name"] = sales["country_name"].fillna(sales["country_code"].map(CORRECTIONS))
+    manquants = sales.loc[sales["country_name"].isna(), "country_code"].unique()
+    if len(manquants) > 0:
+        raise ValueError(f"Codes pays absents du référentiel : {list(manquants)}. Les ajouter dans CORRECTIONS.")
+    ligne_nl = pd.DataFrame([{"country_code": "NL", "country_name": CORRECTIONS["NL"], "currency_code": "EUR"}])
+    
+    # 6. Calcul du CA brut et net
+    sales["gross_revenue_gbp"] = sales['quantity'] * sales['price_gbp']
+    sales["gross_revenue_eur"] = sales['quantity'] * sales['price_eur']
+    sales["revenue_gbp"] = sales["gross_revenue_gbp"] * (1 - sales['discount_rate'])
+    sales["revenue_eur"] = sales["gross_revenue_eur"] * (1 - sales['discount_rate'])
+
+    # 7. Agrégation sales_by_country
+    sales_by_country = (
+        sales
+        .groupby(['country_code','country_name'])
+        .agg(
+        total_orders=('order_id', 'nunique'),
+        total_quantity=('quantity', 'sum'),
+        total_revenue_gbp=('revenue_gbp','sum'),
+        total_revenue_eur=('revenue_eur','sum'),
+        total_gross_revenue_gbp=('gross_revenue_gbp','sum'),
+        total_gross_revenue_eur=('gross_revenue_eur','sum'))
+        .reset_index()
+        .round(2)
+        .sort_values(by='total_revenue_eur', ascending=False, ignore_index=True)
+)
+    # 8. Préparation des 6 tables finales (colonnes dans l'ordre du schéma)
+    countries = pd.concat([countries, ligne_nl], ignore_index=True)
+    countries_final = countries[["country_code", "country_name", "currency_code"]]
+
+    channels_final = channels[["channel_code", "channel_name", "acquisition_cost_gbp", "channel_group", "is_active"]]
+
+    # exchange_rate : déjà au format attendu, rien à faire 
+
+    livres_ids = sales[["book_id", "book_name"]].drop_duplicates()
+    catalogue_final = catalogue.merge(livres_ids, on="book_name", how='left')
+    catalogue_final["rate_date"] = rate_date
+    catalogue_final = catalogue_final[["book_id", "book_name", "price_gbp", "price_eur", "rate_date"]]
+
+    sales_final = sales[["order_id", "order_date", "book_id", "country_code", "channel_code","quantity","discount_rate","revenue_gbp", "revenue_eur", "gross_revenue_gbp", "gross_revenue_eur"]].copy()
+    sales_final["order_date"] = sales_final["order_date"].dt.strftime("%Y-%m-%d")
+
+    sales_by_country_final = sales_by_country[["country_code", "country_name", "total_orders", "total_quantity",
+                                           "total_revenue_gbp", "total_revenue_eur",
+                                           "total_gross_revenue_gbp", "total_gross_revenue_eur"]]
+    
+    return {
+        "countries": countries_final,
+        "channels": channels_final,
+        "exchange_rates": exchange_rate,
+        "catalogue": catalogue_final,
+        "sales": sales_final,
+        "sales_by_country": sales_by_country_final,
+    }
 
 
 # --- 3. Chargement ---
 def load(tables, db_path, schema_path):
     """Crée la base finale à partir du schéma et charge les tables."""
+    if not os.path.exists(schema_path):
+        raise FileNotFoundError(f"Fichier de schéma introuvable : {schema_path}")
 
+    conn_final = sqlite3.connect(db_path)
+    try:
+        conn_final.execute("PRAGMA foreign_keys = ON")
+
+        with open(schema_path, encoding="utf-8") as f:
+            conn_final.executescript(f.read())
+
+        for nom, df in tables.items():
+            df.to_sql(nom, conn_final, if_exists="append", index=False)
+
+        conn_final.commit()
+
+    finally:
+        conn_final.close()
+    
 
 # --- Point d'entrée ---
 def main():
@@ -103,7 +200,11 @@ def main():
     countries, channels = extract_reference(REFERENCE_DB)
     catalogue = extract_catalogue(CATALOGUE_URL)
     exchange_rate = extract_exchange_rate(EXCHANGE_URL)
-    print(exchange_rate.shape)
 
+    tables = transform(sales, countries, channels, catalogue, exchange_rate)
+
+    load(tables, FINAL_DB, SCHEMA_SQL)
+    print("Pipeline terminé : base finale créée.")
+    
 if __name__ == "__main__":
     main()
