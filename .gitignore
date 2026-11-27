@@ -13,3 +13,4 @@ __pycache__/
 
 # Base finale : générée par pipeline.py
 bookworld_final.db
+bookworld_test.db
